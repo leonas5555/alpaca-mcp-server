@@ -302,4 +302,4 @@ async def close_all_positions(cancel_orders: bool = True) -> str:
 
 # Run the server
 if __name__ == "__main__":
-    mcp.run(transport='stdio')
+    mcp.run(transport='sse')

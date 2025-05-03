@@ -131,6 +131,63 @@ async def get_stock_bars(symbol: str, days: int = 5) -> str:
     except Exception as e:
         return f"Error fetching historical data for {symbol}: {str(e)}"
 
+@mcp.tool()
+async def get_stock_bars_intraday(symbol: str, timeframe: str = "1Min", start: str = None, limit: int = 50) -> dict:
+    """
+    Get historical intraday price bars for a stock.
+    
+    Args:
+        symbol: Stock ticker symbol (e.g., AAPL, MSFT)
+        timeframe: Timeframe for the bars (e.g., 1Min, 5Min, 15Min)
+        start: Start datetime in ISO format (default: 1 day ago)
+        limit: Maximum number of bars to return (default: 50)
+    """
+    try:
+        # Calculate start time if not provided
+        if not start:
+            start_time = datetime.now() - timedelta(days=1)
+        else:
+            start_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        
+        # Convert timeframe string to TimeFrame enum
+        if timeframe == "1Min":
+            tf = TimeFrame.Minute
+        elif timeframe == "5Min":
+            tf = TimeFrame.Minute * 5
+        elif timeframe == "15Min":
+            tf = TimeFrame.Minute * 15
+        elif timeframe == "Hour" or timeframe == "1Hour":
+            tf = TimeFrame.Hour
+        else:
+            tf = TimeFrame.Minute  # Default to 1 minute
+        
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start_time,
+            limit=limit
+        )
+        
+        bars = stock_client.get_stock_bars(request_params)
+        
+        # Convert to serializable format
+        result = {}
+        if symbol in bars:
+            result[symbol] = []
+            for bar in bars[symbol]:
+                result[symbol].append({
+                    "timestamp": bar.timestamp.isoformat(),
+                    "open": float(bar.open),
+                    "high": float(bar.high),
+                    "low": float(bar.low),
+                    "close": float(bar.close),
+                    "volume": int(bar.volume)
+                })
+        
+        return result
+    except Exception as e:
+        return {"error": f"Error fetching intraday data for {symbol}: {str(e)}"}
+
 # Order management tools
 @mcp.tool()
 async def get_orders(status: str = "all", limit: int = 10) -> str:

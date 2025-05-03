@@ -1,5 +1,8 @@
 import os
-from typing import Dict, Any, List, Optional
+import json
+import asyncio
+import websockets
+from typing import Dict, Any, List, Optional, Set
 from datetime import datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 from alpaca.trading.client import TradingClient
@@ -23,6 +26,187 @@ if not API_KEY or not API_SECRET:
 # Initialize trading and data clients
 trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
 stock_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+# WebSocket connection manager
+class AlpacaWebSocketManager:
+    """
+    Manages WebSocket connections to Alpaca's streaming API.
+    """
+    def __init__(self):
+        self.connections = {}  # Map of session_id to websocket connection
+        self.subscriptions = {}  # Map of session_id to set of symbols
+        self.ws_url = "wss://stream.data.alpaca.markets/v2/iex"
+        self.paper_ws_url = "wss://stream.data.sandbox.alpaca.markets/v2/iex"
+        self.running = True
+        self.handlers = {}  # Map of session_id to handler function
+
+    async def connect(self, session_id: str, handler, paper: bool = True):
+        """
+        Connect to Alpaca's WebSocket API.
+        
+        Args:
+            session_id: Unique ID for this connection
+            handler: Callback function to handle incoming messages
+            paper: Whether to use the paper trading environment
+        """
+        if session_id in self.connections:
+            await self.disconnect(session_id)
+            
+        self.handlers[session_id] = handler
+        self.subscriptions[session_id] = set()
+        
+        url = self.paper_ws_url if paper else self.ws_url
+        
+        try:
+            websocket = await websockets.connect(url)
+            self.connections[session_id] = websocket
+            
+            # Authenticate
+            auth_msg = {
+                "action": "auth",
+                "key": API_KEY,
+                "secret": API_SECRET
+            }
+            await websocket.send(json.dumps(auth_msg))
+            response = await websocket.recv()
+            print(f"Auth response: {response}")
+            
+            # Start listener task
+            asyncio.create_task(self._listener(session_id))
+            
+            return True
+        except Exception as e:
+            print(f"WebSocket connection error: {e}")
+            return False
+    
+    async def disconnect(self, session_id: str):
+        """Disconnect from Alpaca's WebSocket API."""
+        if session_id in self.connections:
+            try:
+                await self.connections[session_id].close()
+            except Exception as e:
+                print(f"Error closing WebSocket: {e}")
+            finally:
+                del self.connections[session_id]
+                if session_id in self.subscriptions:
+                    del self.subscriptions[session_id]
+                if session_id in self.handlers:
+                    del self.handlers[session_id]
+    
+    async def subscribe(self, session_id: str, symbols: List[str]):
+        """Subscribe to symbols for the specified session."""
+        if session_id not in self.connections:
+            return False
+        
+        websocket = self.connections[session_id]
+        
+        # Add the symbols to our subscription set
+        new_symbols = set(symbols) - self.subscriptions[session_id]
+        if not new_symbols:
+            return True  # Already subscribed
+        
+        self.subscriptions[session_id].update(new_symbols)
+        
+        # Send subscription message
+        sub_msg = {
+            "action": "subscribe",
+            "trades": list(new_symbols),
+            "quotes": list(new_symbols),
+            "bars": list(new_symbols)
+        }
+        
+        try:
+            await websocket.send(json.dumps(sub_msg))
+            return True
+        except Exception as e:
+            print(f"WebSocket subscription error: {e}")
+            return False
+    
+    async def unsubscribe(self, session_id: str, symbols: List[str]):
+        """Unsubscribe from symbols for the specified session."""
+        if session_id not in self.connections:
+            return False
+        
+        websocket = self.connections[session_id]
+        
+        # Remove the symbols from our subscription set
+        symbols_to_unsub = set(symbols) & self.subscriptions[session_id]
+        if not symbols_to_unsub:
+            return True  # Not subscribed to these symbols
+        
+        self.subscriptions[session_id] -= symbols_to_unsub
+        
+        # Send unsubscription message
+        unsub_msg = {
+            "action": "unsubscribe",
+            "trades": list(symbols_to_unsub),
+            "quotes": list(symbols_to_unsub),
+            "bars": list(symbols_to_unsub)
+        }
+        
+        try:
+            await websocket.send(json.dumps(unsub_msg))
+            return True
+        except Exception as e:
+            print(f"WebSocket unsubscription error: {e}")
+            return False
+    
+    async def _listener(self, session_id: str):
+        """Listen for incoming messages from the WebSocket."""
+        if session_id not in self.connections:
+            return
+        
+        websocket = self.connections[session_id]
+        handler = self.handlers[session_id]
+        
+        try:
+            while self.running:
+                message = await websocket.recv()
+                data = json.loads(message)
+                
+                # Process the message
+                if isinstance(data, list):
+                    for item in data:
+                        if 'T' in item:
+                            msg_type = item['T']
+                            
+                            # Parse different message types
+                            if msg_type == 't':  # Trade
+                                await handler('trade', item)
+                            elif msg_type == 'q':  # Quote
+                                await handler('quote', item)
+                            elif msg_type == 'b':  # Bar/Agg
+                                await handler('bar', item)
+                            elif msg_type == 'error':
+                                print(f"WebSocket error: {item}")
+                            elif msg_type in ('success', 'subscription'):
+                                # Control messages, can be logged or ignored
+                                pass
+                            else:
+                                print(f"Unknown message type: {msg_type}")
+        except websockets.exceptions.ConnectionClosed:
+            print(f"WebSocket connection closed for session {session_id}")
+        except Exception as e:
+            print(f"WebSocket listener error: {e}")
+        finally:
+            # Try to reconnect
+            if session_id in self.connections:
+                del self.connections[session_id]
+                
+                # Attempt to reconnect in 5 seconds
+                await asyncio.sleep(5)
+                if self.running:
+                    # Get the symbols we were subscribed to
+                    symbols = list(self.subscriptions.get(session_id, set()))
+                    if session_id in self.handlers:
+                        handler = self.handlers[session_id]
+                        # Reconnect and resubscribe
+                        if await self.connect(session_id, handler):
+                            if symbols:
+                                await self.subscribe(session_id, symbols)
+
+# Create the WebSocket manager
+ws_manager = AlpacaWebSocketManager()
 
 # Account information tools
 @mcp.tool()
@@ -187,6 +371,137 @@ async def get_stock_bars_intraday(symbol: str, timeframe: str = "1Min", start: s
         return result
     except Exception as e:
         return {"error": f"Error fetching intraday data for {symbol}: {str(e)}"}
+
+# WebSocket streaming tools
+@mcp.tool()
+async def start_websocket_stream(session_id: str, symbols: List[str], paper: bool = True) -> Dict[str, Any]:
+    """
+    Start a WebSocket stream for real-time market data.
+    
+    Args:
+        session_id: Unique ID for this streaming session
+        symbols: List of stock ticker symbols to subscribe to
+        paper: Whether to use the paper trading environment
+    """
+    async def message_handler(message_type, message):
+        # Convert message to a format compatible with our MarketBar model
+        if message_type == 'bar':
+            # For bar/agg messages
+            return {
+                "event_type": "bar",
+                "data": {
+                    "timestamp": message.get('t'),
+                    "symbol": message.get('S'),
+                    "open": float(message.get('o', 0)),
+                    "high": float(message.get('h', 0)),
+                    "low": float(message.get('l', 0)),
+                    "close": float(message.get('c', 0)),
+                    "volume": float(message.get('v', 0))
+                }
+            }
+        elif message_type == 'quote':
+            # For quote messages
+            return {
+                "event_type": "quote",
+                "data": {
+                    "timestamp": message.get('t'),
+                    "symbol": message.get('S'),
+                    "bid_price": float(message.get('bp', 0)),
+                    "ask_price": float(message.get('ap', 0)),
+                    "bid_size": float(message.get('bs', 0)),
+                    "ask_size": float(message.get('as', 0))
+                }
+            }
+        elif message_type == 'trade':
+            # For trade messages
+            return {
+                "event_type": "trade",
+                "data": {
+                    "timestamp": message.get('t'),
+                    "symbol": message.get('S'),
+                    "price": float(message.get('p', 0)),
+                    "size": float(message.get('s', 0))
+                }
+            }
+    
+    # Set the message handler to push updates via SSE
+    ws_handler = mcp.create_sse_push_handler(message_handler)
+    
+    # Connect to Alpaca's WebSocket API
+    success = await ws_manager.connect(session_id, ws_handler, paper)
+    
+    if success and symbols:
+        # Subscribe to the specified symbols
+        await ws_manager.subscribe(session_id, symbols)
+    
+    return {
+        "session_id": session_id,
+        "status": "connected" if success else "failed",
+        "subscribed_symbols": list(ws_manager.subscriptions.get(session_id, set()))
+    }
+
+@mcp.tool()
+async def stop_websocket_stream(session_id: str) -> Dict[str, Any]:
+    """
+    Stop a WebSocket stream.
+    
+    Args:
+        session_id: Unique ID for the streaming session to stop
+    """
+    await ws_manager.disconnect(session_id)
+    
+    return {
+        "session_id": session_id,
+        "status": "disconnected"
+    }
+
+@mcp.tool()
+async def subscribe_websocket_symbols(session_id: str, symbols: List[str]) -> Dict[str, Any]:
+    """
+    Subscribe to additional symbols on an active WebSocket stream.
+    
+    Args:
+        session_id: Unique ID for the streaming session
+        symbols: List of stock ticker symbols to subscribe to
+    """
+    if session_id not in ws_manager.connections:
+        return {
+            "session_id": session_id,
+            "status": "not_connected",
+            "error": "No active WebSocket connection for this session ID"
+        }
+    
+    success = await ws_manager.subscribe(session_id, symbols)
+    
+    return {
+        "session_id": session_id,
+        "status": "subscribed" if success else "failed",
+        "subscribed_symbols": list(ws_manager.subscriptions.get(session_id, set()))
+    }
+
+@mcp.tool()
+async def unsubscribe_websocket_symbols(session_id: str, symbols: List[str]) -> Dict[str, Any]:
+    """
+    Unsubscribe from symbols on an active WebSocket stream.
+    
+    Args:
+        session_id: Unique ID for the streaming session
+        symbols: List of stock ticker symbols to unsubscribe from
+    """
+    if session_id not in ws_manager.connections:
+        return {
+            "session_id": session_id,
+            "status": "not_connected",
+            "error": "No active WebSocket connection for this session ID"
+        }
+    
+    success = await ws_manager.unsubscribe(session_id, symbols)
+    
+    return {
+        "session_id": session_id,
+        "status": "unsubscribed" if success else "failed",
+        "subscribed_symbols": list(ws_manager.subscriptions.get(session_id, set()))
+    }
 
 # Order management tools
 @mcp.tool()

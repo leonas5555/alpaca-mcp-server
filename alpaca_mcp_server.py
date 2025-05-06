@@ -37,6 +37,8 @@ class AlpacaWebSocketManager:
         self.subscriptions = {}  # Map of session_id to set of symbols
         self.ws_url = "wss://stream.data.alpaca.markets/v2/iex"
         self.paper_ws_url = "wss://stream.data.sandbox.alpaca.markets/v2/iex"
+        self.trade_updates_url = "wss://api.alpaca.markets/stream"
+        self.paper_trade_updates_url = "wss://paper-api.alpaca.markets/stream"
         self.running = True
         self.handlers = {}  # Map of session_id to handler function
 
@@ -207,6 +209,105 @@ class AlpacaWebSocketManager:
 
 # Create the WebSocket manager
 ws_manager = AlpacaWebSocketManager()
+
+# Create a second WebSocket manager for trade updates
+class TradeUpdatesWebSocketManager:
+    """
+    Manages WebSocket connections to Alpaca's trade updates streaming API.
+    """
+    def __init__(self):
+        self.connections = {}  # Map of session_id to websocket connection
+        self.ws_url = "wss://api.alpaca.markets/stream"
+        self.paper_ws_url = "wss://paper-api.alpaca.markets/stream"
+        self.running = True
+        self.handlers = {}  # Map of session_id to handler function
+    
+    async def connect(self, session_id: str, handler, paper: bool = True):
+        """
+        Connect to Alpaca's trade updates WebSocket API.
+        
+        Args:
+            session_id: Unique ID for this connection
+            handler: Callback function to handle incoming messages
+            paper: Whether to use the paper trading environment
+        """
+        if session_id in self.connections:
+            await self.disconnect(session_id)
+            
+        self.handlers[session_id] = handler
+        
+        url = self.paper_ws_url if paper else self.ws_url
+        
+        try:
+            websocket = await websockets.connect(url)
+            self.connections[session_id] = websocket
+            
+            # Authenticate
+            auth_msg = {
+                "action": "authenticate",
+                "data": {
+                    "key_id": API_KEY,
+                    "secret_key": API_SECRET
+                }
+            }
+            await websocket.send(json.dumps(auth_msg))
+            response = await websocket.recv()
+            print(f"Trade updates auth response: {response}")
+            
+            # Subscribe to trade updates
+            sub_msg = {
+                "action": "listen",
+                "data": {
+                    "streams": ["trade_updates"]
+                }
+            }
+            await websocket.send(json.dumps(sub_msg))
+            response = await websocket.recv()
+            print(f"Trade updates subscription response: {response}")
+            
+            # Start listener task
+            asyncio.create_task(self._listener(session_id))
+            
+            return True
+        except Exception as e:
+            print(f"Trade updates WebSocket connection error: {e}")
+            return False
+    
+    async def disconnect(self, session_id: str):
+        """Disconnect from Alpaca's WebSocket API."""
+        if session_id in self.connections:
+            try:
+                await self.connections[session_id].close()
+            except Exception as e:
+                print(f"Error closing trade updates WebSocket: {e}")
+            finally:
+                del self.connections[session_id]
+                if session_id in self.handlers:
+                    del self.handlers[session_id]
+    
+    async def _listener(self, session_id: str):
+        """Listen for incoming messages from the WebSocket."""
+        if session_id not in self.connections:
+            return
+        
+        websocket = self.connections[session_id]
+        handler = self.handlers[session_id]
+        
+        try:
+            while self.running:
+                message = await websocket.recv()
+                data = json.loads(message)
+                
+                # Process the message if it's a trade update
+                if 'stream' in data and data['stream'] == 'trade_updates':
+                    await handler(data)
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Trade updates WebSocket connection closed for session {session_id}")
+        except Exception as e:
+            print(f"Trade updates WebSocket listener error: {e}")
+
+# Create the trade updates WebSocket manager
+trade_updates_manager = TradeUpdatesWebSocketManager()
 
 # Account information tools
 @mcp.tool()
@@ -671,6 +772,54 @@ async def close_all_positions(cancel_orders: bool = True) -> str:
         return "Successfully closed all positions."
     except Exception as e:
         return f"Error closing positions: {str(e)}"
+
+@mcp.tool()
+async def start_trade_updates_stream(session_id: str, paper: bool = True) -> Dict[str, Any]:
+    """
+    Start a WebSocket stream for real-time trade updates.
+    
+    Args:
+        session_id: Unique ID for this streaming session
+        paper: Whether to use the paper trading environment
+    
+    Returns:
+        Dict with connection status and session_id
+    """
+    async def message_handler(message):
+        # Extract the trade update data
+        if 'data' in message and 'order' in message['data']:
+            order_data = message['data']['order']
+            event_type = message['data'].get('event')
+            
+            # Format the data to be consistent with our expected format
+            return {
+                "event_type": "order_update",
+                "data": {
+                    "id": order_data.get('id'),
+                    "client_order_id": order_data.get('client_order_id'),
+                    "symbol": order_data.get('symbol'),
+                    "side": order_data.get('side'),
+                    "type": order_data.get('type'),
+                    "status": order_data.get('status'),
+                    "updated_at": order_data.get('updated_at'),
+                    "created_at": order_data.get('created_at'),
+                    "filled_qty": order_data.get('filled_qty'),
+                    "qty": order_data.get('qty'),
+                    "filled_avg_price": order_data.get('filled_avg_price'),
+                    "event": event_type
+                }
+            }
+    
+    # Set the message handler to push updates via SSE
+    ws_handler = mcp.create_sse_push_handler(message_handler)
+    
+    # Connect to Alpaca's trade updates WebSocket API
+    success = await trade_updates_manager.connect(session_id, ws_handler, paper)
+    
+    return {
+        "session_id": session_id,
+        "status": "connected" if success else "failed"
+    }
 
 # Run the server
 if __name__ == "__main__":
